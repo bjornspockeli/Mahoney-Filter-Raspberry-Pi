@@ -13,7 +13,7 @@ SRC 	:= $(wildcard $(SRCDIR)/*.c)
 OBJ 	:= $(SRC:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
 
-$(EXE): $(OBJ)
+$(BUILDDIR)/$(EXE): $(OBJ)
 	$(CC) $^ -o $@ -L $(INCLUDE) $(LIBS)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c #$(DEPS)
