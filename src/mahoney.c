@@ -19,11 +19,27 @@
 #define twoKiDef	(2.0f * 0.0f)	// 2 * integral gain
 
 // Raspberry Pi Pins
-#define INT_PIN		7
+#define MPU6050_INT_PIN		7
+#define HMC5883_INT_PIN		0
+
+// I2C Addresses
+#define MPU6050_ADDR	0x68
+#define HMC5883_ADDR	0x1E
+
+
+// HMC5883 Register Addresses
+#define CONF_REG_A	0x00
+#define CONF_REG_B	0x01
+#define MODE_REG	0x02
+#define DATA_OUT_X_H	0x03
+#define DATA_OUT_X_L	0x04
+#define DATA_OUT_Y_H	0x05
+#define DATA_OUT_Y_L	0x06
+#define DATA_OUT_Z_H	0x07
+#define DATA_OUT_Z_L	0x08
 
 
 // MPU-6050 Register Addresses
-#define MPU_ADDR	0x68
 #define PWR_MGMT_1	0x6B
 #define ACCEL_XOUT_H	0x3B
 #define GYRO_XOUT_H	0x43
@@ -31,10 +47,10 @@
 #define SMPRT_DIV 	0x19
 #define INT_ENABLE	0x38
 
-// Software defines
+// Other defines
 #define ARRAY_SIZE	1000
 
-// Senosr Offsets
+// Sensor Offsets
 #define X_ACC_OFFSET	238
 #define Y_ACC_OFFSET	168
 #define Z_ACC_OFFSET	309
@@ -43,6 +59,9 @@
 #define Y_GYRO_OFFSET	215
 #define Z_GYRO_OFFSET	79
 
+#define X_MAG_OFFSET	0
+#define Y_MAG_OFFSET	0
+#define Z_MAG_OFFSET	0
 
 //---------------------------------------------------------------------------------------------------
 // Variable definitions
@@ -52,8 +71,11 @@ volatile float twoKi = twoKiDef;						// 2 * integral gain (Ki)
 volatile float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;			// quaternion of sensor frame relative to auxiliary frame
 volatile float integralFBx = 0.0f,  integralFBy = 0.0f, integralFBz = 0.0f;	// integral error terms scaled by Ki
 
+// I2C BUS Filehandles
 static int i2c_handle;
+static int i2c_handle_hmc5883;
 
+// Sensor Data Structures Typedefs
 typedef struct {
 	int16_t x_acc;
 	int16_t y_acc;
@@ -63,14 +85,24 @@ typedef struct {
 	int16_t z_gyro;
 } MPU6050_Data_t;
 
+typedef struct {
+	int16_t x_mag;
+	int16_t y_mag;
+	int16_t z_mag;
+} HMC5883_Data_t;
+
 int array_counter = 0;
 
 volatile int measurements_done = 0;
 
 // New measurements flag
-volatile int new_measurements = 0;
+volatile int new_measurements		= 0;
+volatile int new_mag_measurement 	= 0;
 
+
+// Sensor Data Structures
 volatile MPU6050_Data_t mpu6050_data;
+volatile HMC5883_Data_t hmc5883_data;
 
 MPU6050_Data_t mpu6050_data_array[ARRAY_SIZE];
 
@@ -84,7 +116,7 @@ const MPU6050_Data_t * p_mpu6050_data = mpu6050_data_array;
 //---------------------------------------------------------------------------------------------------
 // Function to initializing the I2C Bus
 
-void i2c_init( int * i2c_handle)
+void i2c_init( int * i2c_handle, uint8_t slave_addr)
 {
 
 	char *filename =(char*)"/dev/i2c-1";
@@ -101,8 +133,8 @@ void i2c_init( int * i2c_handle)
 
 
 	// Set the I2C address to that of the MPU-6050
-	int mpu6050_addr = 0x68;
-	if(ioctl(*i2c_handle, I2C_SLAVE, mpu6050_addr) == -1)
+	//int mpu6050_addr = 0x68;
+	if(ioctl(*i2c_handle, I2C_SLAVE, slave_addr) == -1)
 	{
 		printf("Could not access I2C bus \n");
 	}
@@ -127,7 +159,40 @@ void write_register( int i2c_filehandle, uint8_t * tx_buffer, int bytes)
 }
 
 //---------------------------------------------------------------------------------------------------
-// Function for initializing the the MPU-6050
+// Function for initializing the HMC5883
+
+void hmc5883_init()
+{
+	// put init code here
+	uint8_t tx_buffer[2] = {MODE_REG,0x01};
+	write_register(i2c_handle, tx_buffer, 2);
+}
+
+//---------------------------------------------------------------------------------------------------
+// Function for reading the HMC5883 Magnetometer Data registers
+
+void hmc5883_mag_read(volatile int16_t * p_x_mag, volatile int16_t * p_y_mag, volatile int16_t * p_z_mag)
+{
+	uint8_t reg_addr = DATA_OUT_X_H;
+	uint8_t rx_buffer[6] = {0};
+
+	read_register(i2c_handle_hmc5883, &reg_addr, rx_buffer, 6);
+
+	*p_x_mag = (rx_buffer[0] << 8) | rx_buffer[1];
+	*p_y_mag = (rx_buffer[2] << 8) | rx_buffer[3];
+	*p_z_mag = (rx_buffer[4] << 8) | rx_buffer[5];
+
+	//Put HMC5883 back in single measurement mode
+	uint8_t tx_buffer[2] = {MODE_REG,0x01};
+	write_register(i2c_handle_hmc5883, tx_buffer, 2);
+
+}
+
+
+
+
+//---------------------------------------------------------------------------------------------------
+// Function for initializing the MPU-6050
 
 void mpu_6050_init()
 {
@@ -272,6 +337,21 @@ void mpu6050_ISR()
 	new_measurements = 1;
 }
 
+//---------------------------------------------------------------------------------------------------
+// HMC5883 "Interrupt Service Routine"
+
+void hmc5883_ISR()
+{
+	//printf("HMC5883 Interrupt Detected! \n");
+
+	// Read Magnetometer Data and store it in hmc5883_data struct
+	hmc5883_mag_read(&hmc5883_data.x_mag, &hmc5883_data.y_mag, &hmc5883_data.z_mag);
+
+	//Set new mag measurement flag
+	new_mag_measurement = 1;
+
+}
+
 
 //---------------------------------------------------------------------------------------------------
 // Fast inverse square-root
@@ -378,7 +458,11 @@ int main(int argc, char *argv[])
 	memset(mpu6050_data_array,0,sizeof(MPU6050_Data_t));
 
 	//Initialize the I2C Bus
-	i2c_init(&i2c_handle);
+	i2c_init(&i2c_handle, MPU6050_ADDR);
+	i2c_init(&i2c_handle_hmc5883,HMC5883_ADDR);
+
+	//Initialize the HMC5883
+	hmc5883_init();
 
 	//Initialize the MPU-6050
 	mpu_6050_init();
@@ -396,14 +480,46 @@ int main(int argc, char *argv[])
 	wiringPiSetup() ;
 
 	//Configure the MPU6050 ISR
-	result = wiringPiISR(INT_PIN, INT_EDGE_RISING, mpu6050_ISR );
+	result = wiringPiISR(MPU6050_INT_PIN, INT_EDGE_RISING, mpu6050_ISR );
 	if(result == -1)
 	{
 		printf("Failed to setup interrupt\n");
 	}
 
+	//Configure the HMC5883 ISR
+	result = wiringPiISR(HMC5883_INT_PIN, INT_EDGE_RISING, hmc5883_ISR );
+	if(result == -1)
+	{
+		printf("Failed to setup interrupt\n");
+	}
+
+/*
+	uint8_t rx_buffer[1] = {0};
+	uint8_t reg_addr = 0x75;
+
+	read_register(i2c_handle, &reg_addr,rx_buffer,1);
+	printf("MPU6050 ADDR: %d \n", rx_buffer[0]);
+
+	i2c_change_slave_addr(i2c_handle, HMC5883_ADDR);
+
+	reg_addr = 0x0A;
+	read_register(i2c_handle, &reg_addr,rx_buffer,1);
+	printf("HMC5883 ADDR: %d \n", rx_buffer[0]);
+*/
+	int16_t x_mag, y_mag, z_mag;
+/*
+	hmc5883_mag_read(&x_mag, &y_mag, &z_mag);
+
+	printf("X: %d Y: %d Z: %d \n",x_mag, y_mag, z_mag);
+*/
+	hmc5883_mag_read(&x_mag, &y_mag, &z_mag);
+
+	printf("Initial X: %d Y: %d Z: %d \n",x_mag, y_mag, z_mag);
+
+
 	float ax, ay, az = 0;
 	float gx, gy, gz = 0;
+	float mx, my, mz = 0;
 	volatile float phi, theta, psi = 0;
 
 	for(;;)
@@ -427,6 +543,15 @@ int main(int argc, char *argv[])
 			quaternion2euler(&phi, &theta, &psi, q0, q1, q2 ,q3);
 			printf("Euler Angles: phi: %f theta: %f psi: %f \n", phi*(180/M_PI), theta*(180/M_PI), psi*(180/M_PI));
 		}
+		if(new_mag_measurement)
+		{
+			mx =(hmc5883_data.x_mag - X_MAG_OFFSET)/1090.0;
+			my =(hmc5883_data.y_mag - Y_MAG_OFFSET)/1090.0;
+			mz =(hmc5883_data.z_mag - Z_MAG_OFFSET)/1090.0;
+			printf("Magnetometer: X: %f Y: %f Z: %f \n", mx, my, mz);
+
+		}
+
 	}
 	return 0;
 }
