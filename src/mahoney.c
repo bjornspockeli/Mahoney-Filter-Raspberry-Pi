@@ -653,7 +653,13 @@ int main(int argc, char *argv[])
 			mx =(hmc5883_data.x_mag - X_MAG_OFFSET)/1090.0;
 			my =(hmc5883_data.y_mag - Y_MAG_OFFSET)/1090.0;
 			mz =(hmc5883_data.z_mag - Z_MAG_OFFSET)/1090.0;
-			printf("Magnetometer: X: %f Y: %f Z: %f \n", mx, my, mz);
+
+			MahonyAHRSupdate(gx, gy, gz, ax, ay, az, mx, my, mz);
+
+			//Convert from Quaternions to Euler angles
+			quaternion2euler(&phi, &theta, &psi, q0, q1, q2 ,q3);
+			printf("Euler Angles: phi: %f theta: %f psi: %f \n", phi*(180/M_PI), theta*(180/M_PI), psi*(180/M_PI));
+			//printf("Magnetometer: X: %f Y: %f Z: %f \n", mx, my, mz);
 
 		}
 
