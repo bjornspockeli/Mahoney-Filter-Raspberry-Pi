@@ -9,14 +9,14 @@
 #include <string.h>
 //#include <gsl/gsl_math.h>
 #include <math.h>
-
+#include <termios.h>
 
 //---------------------------------------------------------------------------------------------------
 // Definitions
 
 #define sampleFreq	50.f 		// Sample frequency in Hz
 #define twoKpDef	(2.0f * 0.5f)	// 2 * proportional gain
-#define twoKiDef	(2.0f * 0.0f)	// 2 * integral gain
+#define twoKiDef	(2.0f * 0.1f)	// 2 * integral gain
 
 // Raspberry Pi Pins
 #define MPU6050_INT_PIN		7
@@ -75,6 +75,9 @@ volatile float integralFBx = 0.0f,  integralFBy = 0.0f, integralFBz = 0.0f;	// i
 static int i2c_handle;
 static int i2c_handle_hmc5883;
 
+// UART Filehandle
+static int uart0_filestream = -1;
+
 // Sensor Data Structures Typedefs
 typedef struct {
 	int16_t x_acc;
@@ -91,6 +94,12 @@ typedef struct {
 	int16_t z_mag;
 } HMC5883_Data_t;
 
+typedef struct {
+	float x_mag;
+	float y_mag;
+	float z_mag;
+} HMC5883_Corr_Data_t;
+
 int array_counter = 0;
 
 volatile int measurements_done = 0;
@@ -103,6 +112,7 @@ volatile int new_mag_measurement 	= 0;
 // Sensor Data Structures
 volatile MPU6050_Data_t mpu6050_data;
 volatile HMC5883_Data_t hmc5883_data;
+volatile HMC5883_Corr_Data_t hmc5883_corr_data;
 
 MPU6050_Data_t mpu6050_data_array[ARRAY_SIZE];
 
@@ -146,8 +156,18 @@ void i2c_init( int * i2c_handle, uint8_t slave_addr)
 
 void read_register(int i2c_filehandle, uint8_t * reg_addr, uint8_t * rx_buffer, int bytes)
 {
-	write(i2c_filehandle, reg_addr, 1);
-	read(i2c_filehandle, rx_buffer, bytes);
+	int result;
+	result = write(i2c_filehandle, reg_addr, 1);
+	if(result < 0)
+	{
+		printf("Could not write to I2C Bus \n");
+	}
+	result = read(i2c_filehandle, rx_buffer, bytes);
+	if(result < 0)
+	{
+		printf("Could not read from I2C Bus \n");
+	}
+
 }
 
 //---------------------------------------------------------------------------------------------------
@@ -155,7 +175,12 @@ void read_register(int i2c_filehandle, uint8_t * reg_addr, uint8_t * rx_buffer, 
 
 void write_register( int i2c_filehandle, uint8_t * tx_buffer, int bytes)
 {
-	write(i2c_filehandle, tx_buffer, bytes);
+	int result;
+	result = write(i2c_filehandle, tx_buffer, bytes);
+	if(result < 0)
+	{
+		printf("Could not write to I2C Bus \n");
+	}
 }
 
 //---------------------------------------------------------------------------------------------------
@@ -163,9 +188,19 @@ void write_register( int i2c_filehandle, uint8_t * tx_buffer, int bytes)
 
 void hmc5883_init()
 {
-	// put init code here
+	// Set the HMC5883 in Single-Measurement Mode
 	uint8_t tx_buffer[2] = {MODE_REG,0x01};
-	write_register(i2c_handle, tx_buffer, 2);
+	write_register(i2c_handle_hmc5883, tx_buffer, 2);
+
+	// Set measurement rate to 7.5Hz
+	tx_buffer[0] = CONF_REG_A;
+	tx_buffer[1] = 0x01 << 2;
+	write_register(i2c_handle_hmc5883, tx_buffer, 2);
+
+	uint8_t rx_buffer = -1;
+	uint8_t reg_addr = CONF_REG_A;
+	read_register(i2c_handle_hmc5883, &reg_addr, &rx_buffer, 1);
+	printf("CONF_REG_A: %d \n", rx_buffer);
 }
 
 //---------------------------------------------------------------------------------------------------
@@ -333,6 +368,12 @@ void mpu6050_ISR()
 	mpu_6050_gyro_read( &mpu6050_data.x_gyro, &mpu6050_data.y_gyro, &mpu6050_data.z_gyro);
 	mpu_6050_acc_read(&mpu6050_data.x_acc, &mpu6050_data.y_acc, &mpu6050_data.z_acc);
 
+	// Read Magnetometer Data and store it in hmc5883_data struct
+	hmc5883_mag_read(&hmc5883_data.x_mag, &hmc5883_data.y_mag, &hmc5883_data.z_mag);
+
+	//Set new mag measurement flag
+	//new_mag_measurement = 1;
+
 	// Set new measurements flag
 	new_measurements = 1;
 }
@@ -345,10 +386,10 @@ void hmc5883_ISR()
 	//printf("HMC5883 Interrupt Detected! \n");
 
 	// Read Magnetometer Data and store it in hmc5883_data struct
-	hmc5883_mag_read(&hmc5883_data.x_mag, &hmc5883_data.y_mag, &hmc5883_data.z_mag);
+	//hmc5883_mag_read(&hmc5883_data.x_mag, &hmc5883_data.y_mag, &hmc5883_data.z_mag);
 
 	//Set new mag measurement flag
-	new_mag_measurement = 1;
+	//new_mag_measurement = 1;
 
 }
 
@@ -551,6 +592,71 @@ void quaternion2euler(volatile float * phi,volatile float * theta, volatile floa
 	*psi	= atan2( 2*(q1*q2 + q3*q0), ( 1-2*(q2*q2 + q3*q3) ) );
 }
 
+//---------------------------------------------------------------------------------------------------
+// Function to correct Hard and Soft Iron Distortions in Magnetometer Measurements
+
+void mag_correction(volatile HMC5883_Corr_Data_t * hmc5883_corr_data, float raw_mx, float raw_my, float raw_mz)
+{
+	//float M[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+	float bx = 0,by = 0, bz = 0;
+
+	float M[3][3] =
+	{
+		{1.031, 0.009, 0.034},
+		{0.009, 0.967, 0.006},
+		{0.061, 0.023, 1.062}
+	};
+	//float M[3][3] = {{0,0,0},{0,0,0},{0,0,0}};
+	//float bx = 74.713,by =  -165.187, bz = 3.536;
+
+	//float hx,hy,hz = 0; // corrected measurements
+
+	hmc5883_corr_data->x_mag = (M[0][0]*(raw_mx-bx) + M[0][1]*(raw_my-by) + M[0][2]*(raw_mz-bz) );
+	hmc5883_corr_data->y_mag = (M[1][0]*(raw_mx-bx) + M[1][1]*(raw_my-by) + M[1][2]*(raw_mz-bz) );
+	hmc5883_corr_data->z_mag = (M[2][0]*(raw_mx-bx) + M[2][1]*(raw_my-by) + M[2][2]*(raw_mz-bz) );
+
+}
+
+//---------------------------------------------------------------------------------------------------
+// Function to setup the UART
+void uart_init()
+{
+	uart0_filestream = open("/dev/ttyAMA0", O_RDWR | O_NOCTTY | O_NDELAY);
+	if(uart0_filestream == -1)
+	{
+		printf("Could not open UART. \n");
+	}
+
+	struct termios options;
+	tcgetattr(uart0_filestream, &options);
+
+	options.c_cflag = B921600 | CS8 | CLOCAL | CREAD; //B115200
+	options.c_iflag = IGNPAR;
+	options.c_oflag = 0;
+	options.c_lflag = 0;
+
+	tcflush(uart0_filestream, TCIFLUSH);
+	tcsetattr(uart0_filestream, TCSANOW, &options);
+}
+
+//---------------------------------------------------------------------------------------------------
+// Function to send bytes over the UART
+void uart_send_bytes(int * uart_filestream, uint8_t * tx_buffer, uint32_t bytes)
+{
+	if(*uart_filestream != -1)
+	{
+		int bytes_sent = write(*uart_filestream, tx_buffer, bytes);
+		if(bytes_sent < 0)
+		{
+			printf("UART TX Error\n");
+		}
+	}
+
+}
+
+
+
+
 // ##################################################################################################
 // 					Main
 // ##################################################################################################
@@ -558,7 +664,15 @@ void quaternion2euler(volatile float * phi,volatile float * theta, volatile floa
 int main(int argc, char *argv[])
 {
 	int result;
+	//Initialize UART
+	uart_init();
 
+	//Send data over UART
+	uint8_t uart_tx_buffer[29];
+/*
+	sprintf(uart_tx_buffer,"Hello\n");
+	uart_send_bytes(&uart0_filestream,uart_tx_buffer, strlen(uart_tx_buffer));
+*/
 	//MPU6050_Data_t mpu6050_data;
 	memset(mpu6050_data_array,0,sizeof(MPU6050_Data_t));
 
@@ -624,46 +738,171 @@ int main(int argc, char *argv[])
 
 	float ax, ay, az = 0;
 	float gx, gy, gz = 0;
-	float mx, my, mz = 0;
+	//float mx, my, mz = 0;
 	volatile float phi, theta, psi = 0;
+	long * ptr = 0;
+	//uint8_t * p_tx_buf = 0;
 
 	for(;;)
 	{
 		if(new_measurements)
 		{
+			// Reset meas_flag
+			new_measurements = 0;
+
 			// Convert to m/s^2 and rad/s
 			ax = ((mpu6050_data.x_acc - X_ACC_OFFSET)/16384.0)*9.818;
 			ay = ((mpu6050_data.y_acc - Y_ACC_OFFSET)/16384.0)*9.818;
-			az = ((mpu6050_data.z_acc - Z_ACC_OFFSET)/16384.0)*9.8181;
+			az = ((mpu6050_data.z_acc - Z_ACC_OFFSET)/16384.0)*9.818;
 
 			gx = ((mpu6050_data.x_gyro- X_GYRO_OFFSET)/131.0)*(M_PI/180);
 			gy = ((mpu6050_data.y_gyro - Y_GYRO_OFFSET)/131.0)*(M_PI/180);
 			gz = ((mpu6050_data.z_gyro - Z_GYRO_OFFSET)/131.0)*(M_PI/180);
 
+			//Correct Magnetometer measurements for Hard and Soft Iron Distortions
+			mag_correction(&hmc5883_corr_data,
+				(float)hmc5883_data.x_mag,
+				(float)hmc5883_data.y_mag,
+				(float)hmc5883_data.z_mag);
+
+			// Update attitude estiamates
+			MahonyAHRSupdate(gx, gy, gz, ax, ay, az,
+					hmc5883_corr_data.x_mag/1090.0,
+					hmc5883_corr_data.y_mag/1090.0,
+					hmc5883_corr_data.z_mag/1090.0);
+
 			// Update attitude estiamate
-			MahonyAHRSupdateIMU( gx, gy, gz, ax, ay, az);
+			//MahonyAHRSupdateIMU( gx, gy, gz, ax, ay, az);
 			//printf("Quaterions: q0: %f q1: %f q2: %f q4: %f \n",q0,q1,q2,q3);
 
 			//Convert from Quaternions to Euler angles
 			quaternion2euler(&phi, &theta, &psi, q0, q1, q2 ,q3);
 			printf("Euler Angles: phi: %f theta: %f psi: %f \n", phi*(180/M_PI), theta*(180/M_PI), psi*(180/M_PI));
+			//sprintf(uart_tx_buffer,"Euler Angles: phi: %f theta: %f psi: %f \n", phi*(180/M_PI), theta*(180/M_PI), psi*(180/M_PI));
+			//uart_send_bytes(&uart0_filestream,uart_tx_buffer, strlen(uart_tx_buffer));
+
+			// Send estimates over UART
+			ptr = (long *) (&q0);
+			uart_tx_buffer[0] = *ptr;
+			uart_tx_buffer[1] = *ptr>>8;
+			uart_tx_buffer[2] = *ptr>>16;
+			uart_tx_buffer[3] = *ptr>>24;
+			ptr = (long *) (&q1);
+			uart_tx_buffer[4] = *ptr;
+			uart_tx_buffer[5] = *ptr>>8;
+			uart_tx_buffer[6] = *ptr>>16;
+			uart_tx_buffer[7] = *ptr>>24;
+			ptr = (long *) (&q2);
+			uart_tx_buffer[8] = *ptr;
+			uart_tx_buffer[9] = *ptr>>8;
+			uart_tx_buffer[10] = *ptr>>16;
+			uart_tx_buffer[11] = *ptr>>24;
+			ptr = (long *) (&q3);
+			uart_tx_buffer[12] = *ptr;
+			uart_tx_buffer[13] = *ptr>>8;
+			uart_tx_buffer[14] = *ptr>>16;
+			uart_tx_buffer[15] = *ptr>>24;
+			ptr = (long *) (&phi);
+			uart_tx_buffer[16] = *ptr;
+			uart_tx_buffer[17] = *ptr>>8;
+			uart_tx_buffer[18] = *ptr>>16;
+			uart_tx_buffer[19] = *ptr>>24;
+			ptr = (long *) (&theta);
+			uart_tx_buffer[20] = *ptr;
+			uart_tx_buffer[21] = *ptr>>8;
+			uart_tx_buffer[22] = *ptr>>16;
+			uart_tx_buffer[23] = *ptr>>24;
+			ptr = (long *) (&psi);
+			uart_tx_buffer[24] = *ptr;
+			uart_tx_buffer[25] = *ptr>>8;
+			uart_tx_buffer[26] = *ptr>>16;
+			uart_tx_buffer[27] = *ptr>>24;
+			uart_tx_buffer[28] = '\n';
+			uart_send_bytes(&uart0_filestream,uart_tx_buffer, sizeof(uart_tx_buffer));
+
+
 		}
 		if(new_mag_measurement)
 		{
-			mx =(hmc5883_data.x_mag - X_MAG_OFFSET)/1090.0;
+			// Reset new_mag_meas flag
+			new_mag_measurement = 0;
+
+			printf("Raw Magnetometer: X: %d Y: %d Z: %d \n",
+				hmc5883_data.x_mag,
+				hmc5883_data.y_mag,
+				hmc5883_data.z_mag);
+
+			// Convert  to Gauss
+		/*	mx =(hmc5883_data.x_mag - X_MAG_OFFSET)/1090.0;
 			my =(hmc5883_data.y_mag - Y_MAG_OFFSET)/1090.0;
 			mz =(hmc5883_data.z_mag - Z_MAG_OFFSET)/1090.0;
+		*/
+			//Correct Magnetometer measurements for Hard and Soft Iron Distortions
+			mag_correction(&hmc5883_corr_data,
+				(float)hmc5883_data.x_mag,
+				(float)hmc5883_data.y_mag,
+				(float)hmc5883_data.z_mag);
 
-			MahonyAHRSupdate(gx, gy, gz, ax, ay, az, mx, my, mz);
+			MahonyAHRSupdate(gx, gy, gz, ax, ay, az,
+					hmc5883_corr_data.x_mag,
+					hmc5883_corr_data.y_mag,
+					hmc5883_corr_data.z_mag);
 
 			//Convert from Quaternions to Euler angles
 			quaternion2euler(&phi, &theta, &psi, q0, q1, q2 ,q3);
 			printf("Euler Angles: phi: %f theta: %f psi: %f \n", phi*(180/M_PI), theta*(180/M_PI), psi*(180/M_PI));
-			//printf("Magnetometer: X: %f Y: %f Z: %f \n", mx, my, mz);
+		/*	printf("Scaled Magnetometer: X: %f Y: %f Z: %f \n", mx, my, mz);
+			printf("Corrected Magnetometer: X: %f Y: %f Z: %f \n",
+				hmc5883_corr_data.x_mag/1090.0,
+				hmc5883_corr_data.y_mag/1090.0,
+				hmc5883_corr_data.z_mag/1090.0);
+		*/
+			//sprintf(uart_tx_buffer, "Euler Angles: phi: %f theta: %f psi: %f \n", phi*(180/M_PI), theta*(180/M_PI), psi*(180/M_PI));
+
+			// Send estimates over UART
+			ptr = (long *) (&q0);
+			uart_tx_buffer[0] = *ptr;
+			uart_tx_buffer[1] = *ptr>>8;
+			uart_tx_buffer[2] = *ptr>>16;
+			uart_tx_buffer[3] = *ptr>>24;
+			ptr = (long *) (&q1);
+			uart_tx_buffer[4] = *ptr;
+			uart_tx_buffer[5] = *ptr>>8;
+			uart_tx_buffer[6] = *ptr>>16;
+			uart_tx_buffer[7] = *ptr>>24;
+			ptr = (long *) (&q2);
+			uart_tx_buffer[8] = *ptr;
+			uart_tx_buffer[9] = *ptr>>8;
+			uart_tx_buffer[10] = *ptr>>16;
+			uart_tx_buffer[11] = *ptr>>24;
+			ptr = (long *) (&q3);
+			uart_tx_buffer[12] = *ptr;
+			uart_tx_buffer[13] = *ptr>>8;
+			uart_tx_buffer[14] = *ptr>>16;
+			uart_tx_buffer[15] = *ptr>>24;
+			ptr = (long *) (&phi);
+			uart_tx_buffer[16] = *ptr;
+			uart_tx_buffer[17] = *ptr>>8;
+			uart_tx_buffer[18] = *ptr>>16;
+			uart_tx_buffer[19] = *ptr>>24;
+			ptr = (long *) (&theta);
+			uart_tx_buffer[20] = *ptr;
+			uart_tx_buffer[21] = *ptr>>8;
+			uart_tx_buffer[22] = *ptr>>16;
+			uart_tx_buffer[23] = *ptr>>24;
+			ptr = (long *) (&psi);
+			uart_tx_buffer[24] = *ptr;
+			uart_tx_buffer[25] = *ptr>>8;
+			uart_tx_buffer[26] = *ptr>>16;
+			uart_tx_buffer[27] = *ptr>>24;
+			uart_tx_buffer[28] = '\n';
+			uart_send_bytes(&uart0_filestream,uart_tx_buffer, sizeof(uart_tx_buffer));
 
 		}
+
 
 	}
 	return 0;
 }
+
 
